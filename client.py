@@ -5,120 +5,154 @@ from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
-from solders.transaction import Transaction
-from solders.hash import Hash
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from solders.signature import Signature
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
+from solana.rpc.commitment import Confirmed
 
-# Load environment variables from .env file
 load_dotenv()
 
-# --- Configuration ---
+# ------------------ CONFIG ------------------
 SERVER_URL = "http://127.0.0.1:8000/premium-data"
-SOLANA_RPC_URL = "https://api.devnet.solana.com"
-LAMPORTS_PER_SOL = 1_000_000_000
+RPC_URL = "https://api.devnet.solana.com"
+client = Client(RPC_URL)
 
-# Load client wallet private key from environment variable
-try:
-    private_key_b58 = os.getenv("CLIENT_WALLET_PRIVATE_KEY_BASE58")
-    if not private_key_b58:
-        raise ValueError("CLIENT_WALLET_PRIVATE_KEY_BASE58 not found in .env file.")
-    
-    # Create a Keypair object from the Base58 private key string
-    CLIENT_KEYPAIR = Keypair.from_base58_string(private_key_b58)
+# Load client keypair
+secret_b58 = os.getenv("CLIENT_WALLET_PRIVATE_KEY_BASE58")
+if not secret_b58:
+    raise SystemExit("Set CLIENT_WALLET_PRIVATE_KEY_BASE58 in .env")
 
-except Exception as e:
-    print(f"❌ Error loading client wallet: {e}")
-    print("Please ensure CLIENT_WALLET_PRIVATE_KEY_BASE58 is set correctly in your .env file.")
-    exit()
+kp = Keypair.from_base58_string(secret_b58)
+print(f"Client pubkey : {kp.pubkey()}")
 
-# Initialize Solana RPC Client
-solana_client = Client(SOLANA_RPC_URL)
+bal = client.get_balance(kp.pubkey()).value / 1_000_000_000
+print(f"Balance       : {bal:.9f} SOL")
 
-def make_solana_payment(receiver_str: str, lamports: int, reference: str) -> str:
-    """Creates, signs, and sends a Solana transaction."""
-    print(f"\n💸 Initiating payment of {lamports} lamports to {receiver_str}...")
+# ------------------ BULLETPROOF HELPERS ------------------
+def wait_for_confirmation(sig: str, timeout: int = 120) -> bool:
+    """Wait for tx confirmation using string sig directly"""
+    print(f"Waiting for {sig} (up to {timeout}s)...")
 
-    # Get the latest blockhash
-    blockhash_resp = solana_client.get_latest_blockhash()
-    recent_blockhash = blockhash_resp.value.blockhash
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        # 1. Try get_signature_statuses WITH FULL HISTORY
+        statuses = client.get_signature_statuses(
+            [sig], 
+            search_transaction_history=True
+        )
+        status = statuses.value[0]
+        
+        if status and status.confirmation_status == Confirmed:
+            print("CONFIRMED!")
+            return True
+        
+        # 2. BACKUP: Direct get_transaction fetch
+        try:
+            tx_resp = client.get_transaction(
+                sig,  # string, not Signature object
+                encoding="base64",
+                max_supported_transaction_version=0
+            )
+            if tx_resp.value:
+                print("FETCHED DIRECTLY!")
+                return True
+        except:
+            pass
 
-    # Create transfer instruction
-    receiver_pubkey = Pubkey.from_string(receiver_str)
-    transfer_ix = transfer(
+        time.sleep(2)
+
+    print("TIMEOUT - Check explorer:")
+    print(f"   https://explorer.solana.com/tx/{sig}?cluster=devnet")
+    return False
+
+def ensure_receiver_exists(receiver: str):
+    pubkey = Pubkey.from_string(receiver)
+    resp = client.get_balance(pubkey)
+    if resp.value > 0:
+        print(f"Receiver funded: {resp.value / 1e9:.6f} SOL")
+        return
+
+    print("Bootstrapping receiver with 0.002 SOL...")
+    bootstrap_lamports = 2_039_280
+    bh = client.get_latest_blockhash().value.blockhash
+    ix = transfer(
         TransferParams(
-            from_pubkey=CLIENT_KEYPAIR.pubkey(),
-            to_pubkey=receiver_pubkey,
-            lamports=lamports,
+            from_pubkey=kp.pubkey(),
+            to_pubkey=pubkey,
+            lamports=bootstrap_lamports
         )
     )
-    
-    # Create transaction
-    transaction = Transaction.new_signed_with_payer(
-        [transfer_ix],
-        CLIENT_KEYPAIR.pubkey(),
-        [CLIENT_KEYPAIR],
-        recent_blockhash,
+    msg = MessageV0.try_compile(
+        payer=kp.pubkey(),
+        instructions=[ix],
+        address_lookup_table_accounts=[],
+        recent_blockhash=bh
     )
-
-    # Send the transaction
-    print("🚀 Sending transaction to Solana devnet...")
-    tx_signature = solana_client.send_transaction(transaction, opts=TxOpts(skip_preflight=True)).value
-    print(f"🖊️ Transaction signature: {tx_signature}")
-
-    # Confirm the transaction
-    print("⏳ Waiting for transaction confirmation...")
-    solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-    print("✅ Transaction confirmed!")
+    tx = VersionedTransaction(msg, [kp])
     
-    return str(tx_signature)
+    opts = TxOpts(skip_preflight=True)
+    sig = client.send_raw_transaction(bytes(tx), opts=opts).value
+    print(f"Bootstrap sent: {sig}")
+    
+    wait_for_confirmation(sig)
 
-def access_premium_content():
-    """Main function to handle the X402 payment flow."""
-    session = requests.Session()
-    headers = {}
+def send_payment(to_addr: str, lamports: int, ref: str) -> str:
+    bh = client.get_latest_blockhash().value.blockhash
+    ix = transfer(
+        TransferParams(
+            from_pubkey=kp.pubkey(),
+            to_pubkey=Pubkey.from_string(to_addr),
+            lamports=lamports
+        )
+    )
+    msg = MessageV0.try_compile(
+        payer=kp.pubkey(),
+        instructions=[ix],
+        address_lookup_table_accounts=[],
+        recent_blockhash=bh
+    )
+    tx = VersionedTransaction(msg, [kp])
+    
+    opts = TxOpts(skip_preflight=True)
+    sig = client.send_raw_transaction(bytes(tx), opts=opts).value
+    print(f"Micropayment sent: {sig}")
+    
+    if not wait_for_confirmation(sig):
+        raise SystemExit("Micropayment failed - check link above")
+    
+    return str(sig)
 
-    print("--- Step 1: Initial request to premium endpoint ---")
-    try:
-        response = session.get(SERVER_URL, headers=headers)
+def main():
+    s = requests.Session()
 
-        if response.status_code == 200:
-            print("✅ Access granted without payment (maybe you paid before?).")
-            print("Server Response:", response.json())
-            return
-        
-        if response.status_code != 402:
-            print(f"❌ Received unexpected status code: {response.status_code}")
-            print("Response Body:", response.text)
-            return
+    # 1. 402
+    r1 = s.get(SERVER_URL)
+    if r1.status_code != 402:
+        print(f"Unexpected: {r1.status_code} {r1.text}")
+        return
 
-        print("🚦 Received 402 Payment Required. Server demands payment.")
-        payment_details = response.json()
-        print("Payment Details:", payment_details)
+    details = r1.json()
+    print("402 Details:")
+    for k, v in details.items():
+        print(f"  {k}: {v}")
 
-        # --- Step 2: Make the payment ---
-        receiver = payment_details["receiver"]
-        amount_lamports = payment_details["amount_lamports"]
-        reference = payment_details["reference"]
-        
-        signature = make_solana_payment(receiver, amount_lamports, reference)
+    # 2. Bootstrap
+    ensure_receiver_exists(details["receiver"])
 
-        # --- Step 3: Retry the request with payment proof ---
-        print("\n--- Step 3: Retrying request with payment proof ---")
-        headers["X-Payment-Signature"] = signature
-        headers["X-Payment-Reference"] = reference
-        
-        final_response = session.get(SERVER_URL, headers=headers)
-        final_response.raise_for_status() # Raise an exception for bad status codes
+    # 3. Pay
+    sig = send_payment(details["receiver"], details["amount_lamports"], details["reference"])
 
-        print("✅ Success! Access granted.")
-        print("Final Server Response:", final_response.json())
-
-    except requests.exceptions.RequestException as e:
-        print(f"\nAn error occurred: {e}")
+    # 4. Retry
+    s.headers.update({
+        "X-Payment-Signature": sig,
+        "X-Payment-Reference": details["reference"]
+    })
+    print("\nRetrying with proof...")
+    r2 = s.get(SERVER_URL)
+    print(f"\nFinal: {r2.status_code}")
+    print(r2.json())
 
 if __name__ == "__main__":
-    print(f"🔑 Client wallet address: {CLIENT_KEYPAIR.pubkey()}")
-    balance_resp = solana_client.get_balance(CLIENT_KEYPAIR.pubkey())
-    print(f"💰 Client wallet balance: {balance_resp.value / LAMPORTS_PER_SOL} SOL")
-    access_premium_content()
+    main()
