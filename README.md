@@ -61,35 +61,7 @@ The protocol is an elegant, stateless dance between a client and a server, orche
 5.  The server extracts the signature, queries a Solana RPC node to fetch the transaction details, and rigorously verifies that the payment was sent to the correct address for the required amount. If valid, it returns a `200 OK` with the premium data.
 
 ## Architecture Diagram
-
-```mermaid
-sequenceDiagram
-    participant Client as Client (e.g., Python Script, AI Agent)
-    participant Server as Server (FastAPI API)
-    participant Solana as Solana Blockchain (Devnet)
-
-    Client->>+Server: 1. GET /premium-data
-    Server-->>-Client: 2. HTTP 402 Payment Required <br> {receiver, amount, reference}
-
-    Note over Client: Parses 402, constructs transaction
-
-    Client->>+Solana: 3. sendTransaction(to: receiver, amount: lamports)
-    Solana-->>-Client: 4. Transaction Confirmed (Returns Signature)
-
-    Note over Client: Attaches signature as proof
-
-    Client->>+Server: 5. GET /premium-data <br> Headers: {X-Payment-Signature, X-Payment-Reference}
-    Server->>+Solana: 6. getTransaction(Signature)
-    Solana-->>-Server: 7. Returns Confirmed Transaction Details
-
-    Note over Server: Verifies amount & receiver against original challenge
-
-    alt Payment Valid
-        Server-->>-Client: 8. HTTP 200 OK <br> { "data": "secret insight..." }
-    else Payment Invalid
-        Server-->>-Client: 8. HTTP 400 Bad Request
-    end
-```
+![alt text](x402_micropayment.png)
 
 ## Getting Started
 
